@@ -18,12 +18,17 @@ const PCS_PASS = process.env.PCS_PASS;
 const PORT = process.env.PORT || 3000;
 
 // =====================
-// IMPORTANTÍSIMO:
-// 1) Webhooks usan RAW body (para HMAC)
-// 2) Todo lo demás usa JSON normal
+// IMPORTANTÍSIMO (FIX DEFINITIVO):
+// Express parsea JSON a objeto, PERO con "verify" guardamos el RAW body (Buffer)
+// que es lo que necesitamos para validar el HMAC de Shopify.
 // =====================
-app.use("/webhooks", express.raw({ type: "application/json" }));
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf; // Buffer con el body original
+    },
+  })
+);
 
 // =====================
 // Helpers: logs simples
@@ -44,6 +49,7 @@ function err(...args) {
 function verifyShopifyHmac(rawBodyBuffer, hmacHeader) {
   if (!SHOPIFY_WEBHOOK_SECRET) return false;
   if (!hmacHeader) return false;
+  if (!rawBodyBuffer || !(rawBodyBuffer instanceof Buffer)) return false;
 
   const digest = crypto
     .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
@@ -216,11 +222,14 @@ async function createPcServiceOrder({ orderNumber, email, comment, items, shippi
 app.post("/webhooks/orders_paid", async (req, res) => {
   try {
     const hmac = req.get("X-Shopify-Hmac-Sha256");
-    if (!verifyShopifyHmac(req.body, hmac)) {
+
+    // FIX: validar HMAC con rawBody (Buffer)
+    if (!verifyShopifyHmac(req.rawBody, hmac)) {
       return res.status(401).send("Invalid HMAC");
     }
 
-    const order = JSON.parse(req.body.toString("utf8"));
+    // FIX: ya es objeto (express.json lo parseó)
+    const order = req.body;
 
     if (!["paid", "partially_paid"].includes(order.financial_status)) {
       return res.status(200).send("Not paid");
