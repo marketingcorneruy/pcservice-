@@ -1,3 +1,21 @@
+/**
+ * pcservice-webhook (Shopify orders/paid -> PCService express_checkout)
+ *
+ * CAMBIOS CLAVE (arreglos):
+ * 1) Logs de entrada SIEMPRE (para ver si llega Shopify y con qué headers)
+ * 2) Validación HMAC con rawBody (ya la tenías) + log en caso de mismatch
+ * 3) NO usar vendor (vos lo usás para marca). En su lugar:
+ *    - Identificar ítems PCService por TAG del producto: "proveedor_pcservice"
+ *    - Para eso consultamos GraphQL por variant -> product.tags + metafield pcs id + sku
+ * 4) Resolver productId PCS con prioridad:
+ *    - supplier.pcservice_product_id (metafield en variant)
+ *    - fallback: SKU numérico del variant (si aplica)
+ *    - si no hay forma, skip con warn (mejor que mandar mal)
+ * 5) Cache de variant lookups (para no hacer 1 llamada GraphQL por ítem siempre)
+ * 6) Dedupe en memoria (igual que tenías)
+ * 7) Healthcheck /health
+ */
+
 const express = require("express");
 const fetch = require("node-fetch");
 const crypto = require("crypto");
@@ -18,9 +36,7 @@ const PCS_PASS = process.env.PCS_PASS;
 const PORT = process.env.PORT || 3000;
 
 // =====================
-// IMPORTANTÍSIMO (FIX DEFINITIVO):
-// Express parsea JSON a objeto, PERO con "verify" guardamos el RAW body (Buffer)
-// que es lo que necesitamos para validar el HMAC de Shopify.
+// Shopify Webhooks: rawBody for HMAC
 // =====================
 app.use(
   express.json({
@@ -33,15 +49,29 @@ app.use(
 // =====================
 // Helpers: logs simples
 // =====================
+function iso() {
+  return new Date().toISOString();
+}
 function log(...args) {
-  console.log(new Date().toISOString(), ...args);
+  console.log(iso(), ...args);
 }
 function warn(...args) {
-  console.warn(new Date().toISOString(), ...args);
+  console.warn(iso(), ...args);
 }
 function err(...args) {
-  console.error(new Date().toISOString(), ...args);
+  console.error(iso(), ...args);
 }
+
+// Log de cada request (útil para debug en Render)
+app.use((req, res, next) => {
+  // NO logueamos body entero para no exponer datos, solo tamaños y headers clave
+  const topic = req.get("X-Shopify-Topic") || "";
+  const shop = req.get("X-Shopify-Shop-Domain") || "";
+  const hmacPresent = !!req.get("X-Shopify-Hmac-Sha256");
+
+  log(`[REQ] ${req.method} ${req.path} topic=${topic || "-"} shop=${shop || "-"} hmac=${hmacPresent ? "present" : "missing"} raw=${req.rawBody?.length || 0}B`);
+  next();
+});
 
 // =====================
 // 1) Seguridad Shopify HMAC
@@ -107,7 +137,7 @@ async function getPcServiceToken() {
   if (!j.token) throw new Error("PC Service login: respuesta sin token");
 
   pcsTokenCache = { token: j.token, expiresAt: now + 14 * 60 * 1000 };
-  return pcsTokenCache.token;
+  return j.token;
 }
 
 // =====================
@@ -142,26 +172,63 @@ async function shopifyGraphQL(query, variables = {}) {
   return j.data;
 }
 
-async function getPcServiceProductIdFromVariant(variantIdNumeric) {
+// =====================
+// 4.1) Variant lookup con TAG proveedor_pcservice + pcs id
+// =====================
+const VARIANT_CACHE = new Map();
+const VARIANT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
+
+function cacheGetVariant(variantId) {
+  const hit = VARIANT_CACHE.get(variantId);
+  if (!hit) return null;
+  if (Date.now() - hit.t > VARIANT_CACHE_TTL_MS) {
+    VARIANT_CACHE.delete(variantId);
+    return null;
+  }
+  return hit.v;
+}
+
+function cacheSetVariant(variantId, value) {
+  VARIANT_CACHE.set(variantId, { t: Date.now(), v: value });
+}
+
+async function getVariantPcserviceData(variantIdNumeric) {
+  const cached = cacheGetVariant(variantIdNumeric);
+  if (cached) return cached;
+
   const gid = `gid://shopify/ProductVariant/${variantIdNumeric}`;
   const q = `
-    query GetVariantPcId($id: ID!) {
+    query VariantPcservice($id: ID!) {
       node(id: $id) {
         ... on ProductVariant {
+          sku
           metafield(namespace: "supplier", key: "pcservice_product_id") { value }
+          product { tags }
         }
       }
     }
   `;
-  const data = await shopifyGraphQL(q, { id: gid });
-  const mf = data?.node?.metafield?.value || null;
-  if (!mf) return null;
 
-  const cleaned = String(mf).trim();
-  if (!/^\d+$/.test(cleaned)) return null;
-  return parseInt(cleaned, 10);
+  const data = await shopifyGraphQL(q, { id: gid });
+
+  const tags = data?.node?.product?.tags || [];
+  const isPc = tags.includes("proveedor_pcservice");
+
+  const mf = data?.node?.metafield?.value || null;
+  const cleaned = mf ? String(mf).trim() : "";
+  const pcsId = /^\d+$/.test(cleaned) ? parseInt(cleaned, 10) : null;
+
+  const sku = data?.node?.sku ? String(data.node.sku).trim() : "";
+  const skuNum = /^\d+$/.test(sku) ? parseInt(sku, 10) : null;
+
+  const value = { isPc, pcsId, sku, skuNum, tags };
+  cacheSetVariant(variantIdNumeric, value);
+  return value;
 }
 
+// =====================
+// 4.2) Guardar pcservice_orderid en la Orden (metafield)
+// =====================
 async function setOrderPcServiceOrderId(orderIdNumeric, pcsOrderId) {
   const orderGid = `gid://shopify/Order/${orderIdNumeric}`;
   const m = `
@@ -220,18 +287,25 @@ async function createPcServiceOrder({ orderNumber, email, comment, items, shippi
 // Webhook: orders/paid
 // =====================
 app.post("/webhooks/orders_paid", async (req, res) => {
-  try {
-    const hmac = req.get("X-Shopify-Hmac-Sha256");
+  const topic = req.get("X-Shopify-Topic") || "";
+  const shop = req.get("X-Shopify-Shop-Domain") || "";
+  const hmac = req.get("X-Shopify-Hmac-Sha256");
 
-    // FIX: validar HMAC con rawBody (Buffer)
+  try {
+    // Validar HMAC con rawBody (Buffer)
     if (!verifyShopifyHmac(req.rawBody, hmac)) {
+      warn(`[HMAC] Invalid HMAC topic=${topic || "-"} shop=${shop || "-"} raw=${req.rawBody?.length || 0}B`);
       return res.status(401).send("Invalid HMAC");
     }
 
-    // FIX: ya es objeto (express.json lo parseó)
-    const order = req.body;
+    const order = req.body || {};
+    const financial = order.financial_status;
 
-    if (!["paid", "partially_paid"].includes(order.financial_status)) {
+    log(`[WEBHOOK] orders_paid received id=${order.id || "-"} order_number=${order.order_number || "-"} financial_status=${financial || "-"}`);
+
+    // Solo pagadas
+    if (!["paid", "partially_paid"].includes(financial)) {
+      log(`[SKIP] Not paid financial_status=${financial}`);
       return res.status(200).send("Not paid");
     }
 
@@ -244,15 +318,7 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       return res.status(200).send("OK");
     }
 
-    const pcItems = (order.line_items || []).filter(
-      (i) => i && i.vendor === "PC Service" && i.variant_id && i.quantity
-    );
-
-    if (pcItems.length === 0) {
-      log(`Orden #${orderNumber} sin items de PC Service → ignorada`);
-      return res.status(200).send("No PC Service items");
-    }
-
+    // Construimos comentario/cliente
     const cust = order.customer || {};
     const ship = order.shipping_address || {};
     const comment = [
@@ -261,33 +327,45 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       `Dir: ${ship.address1 || ""} ${ship.address2 || ""}, ${ship.city || ""}, ${ship.province || ""}`.trim(),
       `CP: ${ship.zip || ""}`.trim(),
     ]
+      .map((s) => s.trim())
       .filter(Boolean)
       .join(" | ");
 
     const email = order.email || cust.email || "sin@email.com";
-    const shippingMode = "envia";
+    const shippingMode = "envia"; // o podés mapear según tu lógica
 
+    // Armar items PCService por TAG proveedor_pcservice
     const items = [];
-    for (const li of pcItems) {
-      const pcsProductId = await getPcServiceProductIdFromVariant(li.variant_id);
+    const vendorsSeen = new Set();
 
-      if (!pcsProductId) {
-        const sku = (li.sku || "").trim();
-        if (/^\d+$/.test(sku)) {
-          items.push({ productId: parseInt(sku, 10), quantity: li.quantity });
-          warn(`[WARN] Variant ${li.variant_id} sin metafield pcservice_product_id; usando SKU numérico como fallback`);
-          continue;
-        }
-        warn(`[SKIP] Item sin pcservice_product_id. variant_id=${li.variant_id}, sku=${li.sku}`);
+    for (const li of order.line_items || []) {
+      if (!li?.variant_id || !li?.quantity) continue;
+      if (li.vendor) vendorsSeen.add(li.vendor);
+
+      const info = await getVariantPcserviceData(li.variant_id);
+
+      // Solo productos PCService por tag (fuente de verdad)
+      if (!info.isPc) continue;
+
+      // Resolver productId
+      const productId = info.pcsId || info.skuNum;
+
+      if (!productId) {
+        warn(
+          `[SKIP] PCService item sin supplier.pcservice_product_id y SKU no numérico. variant_id=${li.variant_id} sku=${info.sku}`
+        );
         continue;
       }
 
-      items.push({ productId: pcsProductId, quantity: li.quantity });
+      items.push({ productId, quantity: li.quantity });
     }
 
+    log(`[DEBUG] Orden #${orderNumber} vendors_en_orden=${Array.from(vendorsSeen).join(", ") || "-"}`);
+    log(`[DEBUG] Orden #${orderNumber} pcs_items_count=${items.length}`);
+
     if (items.length === 0) {
-      warn(`Orden #${orderNumber}: no hay items válidos para PC Service (faltan metafields)`);
-      return res.status(200).send("No valid items");
+      log(`Orden #${orderNumber} sin items PCService válidos (tag proveedor_pcservice) → ignorada`);
+      return res.status(200).send("No PC Service items");
     }
 
     const pcsOrderId = await createPcServiceOrder({
@@ -304,7 +382,7 @@ app.post("/webhooks/orders_paid", async (req, res) => {
 
     return res.status(200).send("OK");
   } catch (e) {
-    err("Webhook error:", e?.message || e);
+    err(`[ERR] Webhook orders_paid topic=${topic || "-"} shop=${shop || "-"}:`, e?.message || e);
     return res.status(500).send("Error");
   }
 });
