@@ -331,7 +331,7 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       .filter(Boolean)
       .join(" | ");
 
-    const email = order.email || cust.email || "sin@email.com";
+    const email = "ventas@corner.com.uy";
     const shippingMode = "envia"; // o podés mapear según tu lógica
 
     // Armar items PCService por TAG proveedor_pcservice
