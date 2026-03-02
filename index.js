@@ -14,6 +14,10 @@
  * 5) Cache de variant lookups (para no hacer 1 llamada GraphQL por ítem siempre)
  * 6) Dedupe en memoria (igual que tenías)
  * 7) Healthcheck /health
+ * 8) Detección de shipping mode desde shipping_lines de Shopify:
+ *    - "Retiro en PC Service" / "retiro" / "pickup" / local_pickup → "retira"
+ *    - Todo lo demás (envío express, envío estándar)                → "envia"
+ * 9) Metafield supplier.pcs_shipping_mode en la orden (trazabilidad)
  */
 
 const express = require("express");
@@ -256,6 +260,35 @@ async function setOrderPcServiceOrderId(orderIdNumeric, pcsOrderId) {
 }
 
 // =====================
+// 4.3) Guardar shipping mode en metafield de la orden
+// =====================
+async function setOrderShippingMode(orderIdNumeric, shippingMode) {
+  const orderGid = `gid://shopify/Order/${orderIdNumeric}`;
+  const m = `
+    mutation SetShippingMeta($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const variables = {
+    metafields: [
+      {
+        ownerId: orderGid,
+        namespace: "supplier",
+        key: "pcs_shipping_mode",
+        type: "single_line_text_field",
+        value: shippingMode,
+      },
+    ],
+  };
+
+  const data = await shopifyGraphQL(m, variables);
+  const errs = data?.metafieldsSet?.userErrors || [];
+  if (errs.length) warn("No pude guardar pcs_shipping_mode metafield:", JSON.stringify(errs));
+}
+
+// =====================
 // 5) Crear orden en PC Service
 // =====================
 async function createPcServiceOrder({ orderNumber, email, comment, items, shipping }) {
@@ -281,6 +314,63 @@ async function createPcServiceOrder({ orderNumber, email, comment, items, shippi
   const j = JSON.parse(txt);
   if (!j.orderid) throw new Error(`PC Service: respuesta sin orderid: ${txt}`);
   return j.orderid;
+}
+
+// =====================
+// 6) Detectar shipping mode desde Shopify order
+// =====================
+/**
+ * Lee shipping_lines + note_attributes de la orden de Shopify y determina
+ * si PCS debe despachar ("envia") o si retiramos nosotros ("retira").
+ *
+ * Prioridad:
+ *  1. shipping_line title/code contiene "retiro" o "pickup"  → "retira"
+ *  2. shipping_line title/code contiene "express" + "pc service" → "envia"
+ *  3. note_attribute _pcs_shipping = "retira"                  → "retira"
+ *  4. Default: "envia" (nosotros retiramos en PCS y enviamos al cliente)
+ */
+function detectShippingMode(order) {
+  const shippingLines = order.shipping_lines || [];
+
+  for (const sl of shippingLines) {
+    const title = (sl.title || "").toLowerCase();
+    const code  = (sl.code  || "").toLowerCase();
+
+    // Retiro en PC Service (cliente retira allá)
+    if (
+      title.includes("retiro en pc service") ||
+      title.includes("retiro en pcservice") ||
+      title.includes("retiro pc service") ||
+      title.includes("pickup pc service") ||
+      code.includes("pcs_retira") ||
+      code === "local_pickup"
+    ) {
+      return "retira";
+    }
+
+    // Envío Express PC Service (PCS envía directo al cliente)
+    if (
+      (title.includes("express") && (title.includes("pc service") || title.includes("pcservice"))) ||
+      title.includes("envío express (pc service)") ||
+      title.includes("envio express (pc service)") ||
+      code.includes("pcs_envia")
+    ) {
+      return "envia";
+    }
+  }
+
+  // Fallback: check note_attributes (por si se setea desde el theme o scripts)
+  const noteAttrs = order.note_attributes || [];
+  for (const attr of noteAttrs) {
+    if (attr.name === "_pcs_shipping" || attr.name === "pcs_shipping") {
+      const val = (attr.value || "").toLowerCase().trim();
+      if (val === "retira" || val === "pickup") return "retira";
+      if (val === "envia" || val === "express") return "envia";
+    }
+  }
+
+  // Default: nosotros retiramos en PCS y despachamos al cliente
+  return "envia";
 }
 
 // =====================
@@ -332,7 +422,11 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       .join(" | ");
 
     const email = "ventas@corner.com.uy";
-    const shippingMode = "envia"; // o podés mapear según tu lógica
+
+    // ── DETECTAR SHIPPING MODE desde shipping_lines ──
+    const shippingMode = detectShippingMode(order);
+    const shippingTitles = (order.shipping_lines || []).map((sl) => sl.title).join(", ") || "(ninguno)";
+    log(`[SHIPPING] Orden #${orderNumber} shipping_lines=[${shippingTitles}] → mode="${shippingMode}"`);
 
     // Armar items PCService por TAG proveedor_pcservice
     const items = [];
@@ -368,17 +462,25 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       return res.status(200).send("No PC Service items");
     }
 
+    // Enriquecer comentario con info de shipping para PCS
+    const shippingLabel = shippingMode === "retira"
+      ? "RETIRO EN PCS (cliente retira en local)"
+      : "ENVIO (PCS despacha al cliente)";
+    const fullComment = `${comment} | ${shippingLabel}`;
+
     const pcsOrderId = await createPcServiceOrder({
       orderNumber,
       email,
-      comment,
+      comment: fullComment,
       items,
       shipping: shippingMode,
     });
 
-    log(`OK → Orden #${orderNumber} enviada a PC Service. pcservice_orderid=${pcsOrderId}`);
+    log(`OK → Orden #${orderNumber} enviada a PC Service. pcservice_orderid=${pcsOrderId} shipping=${shippingMode}`);
 
+    // Guardar metafields en Shopify (orderid + shipping mode)
     await setOrderPcServiceOrderId(orderId, pcsOrderId);
+    await setOrderShippingMode(orderId, shippingMode);
 
     return res.status(200).send("OK");
   } catch (e) {
