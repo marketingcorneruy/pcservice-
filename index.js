@@ -295,7 +295,7 @@ async function createPcServiceOrder({ orderNumber, email, comment, items, shippi
   const token = await getPcServiceToken();
 
   const payload = {
-    description: `Orden Shopify #${orderNumber}`,
+    description: `Orden Dropshipping #${orderNumber}`,
     email: email || "sin@email.com",
     comment: comment || "",
     items,
@@ -321,56 +321,148 @@ async function createPcServiceOrder({ orderNumber, email, comment, items, shippi
 // =====================
 /**
  * Lee shipping_lines + note_attributes de la orden de Shopify y determina
- * si PCS debe despachar ("envia") o si retiramos nosotros ("retira").
+ * el shipping mode hacia PCS:
+ *   - "envia":  PCS despacha vía DAC al destino indicado en el comment (DEFAULT)
+ *   - "retira": Corner pasa a buscar el pedido al local de PCS (excepción)
+ *
+ * IMPORTANTE — setup actual del checkout de Shopify (Abr 2026):
+ *   La única opción de envío del cliente es "Envío por DAC". Pickup fue removido
+ *   porque PCS no ofrece retiro a consumidor final, solo retiro Corner.
+ *   Por eso el default es "envia" → PCS despacha vía DAC al destino del cliente,
+ *   que se le pasa a PCS en el campo `comment` (CI, Tel, Dir, CP).
  *
  * Prioridad:
- *  1. shipping_line title/code contiene "retiro" o "pickup"  → "retira"
- *  2. shipping_line title/code contiene "express" + "pc service" → "envia"
- *  3. note_attribute _pcs_shipping = "retira"                  → "retira"
- *  4. Default: "envia" (nosotros retiramos en PCS y enviamos al cliente)
+ *  1. note_attribute _pcs_shipping override (manual, para casos de retiro Corner)
+ *  2. shipping_line title contiene "retiro" / código "local_pickup" → "retira"
+ *  3. Default → "envia" (el caso normal: cliente eligió Envío por DAC)
  */
 function detectShippingMode(order) {
-  const shippingLines = order.shipping_lines || [];
-
-  for (const sl of shippingLines) {
-    const title = (sl.title || "").toLowerCase();
-    const code  = (sl.code  || "").toLowerCase();
-
-    // Retiro en PC Service (cliente retira allá)
-    if (
-      title.includes("retiro en pc service") ||
-      title.includes("retiro en pcservice") ||
-      title.includes("retiro pc service") ||
-      title.includes("pickup pc service") ||
-      code.includes("pcs_retira") ||
-      code === "local_pickup"
-    ) {
-      return "retira";
-    }
-
-    // Envío Express PC Service (PCS envía directo al cliente)
-    if (
-      (title.includes("express") && (title.includes("pc service") || title.includes("pcservice"))) ||
-      title.includes("envío express (pc service)") ||
-      title.includes("envio express (pc service)") ||
-      code.includes("pcs_envia")
-    ) {
-      return "envia";
-    }
-  }
-
-  // Fallback: check note_attributes (por si se setea desde el theme o scripts)
+  // 1. Override manual via note_attribute (casos especiales)
   const noteAttrs = order.note_attributes || [];
   for (const attr of noteAttrs) {
     if (attr.name === "_pcs_shipping" || attr.name === "pcs_shipping") {
       const val = (attr.value || "").toLowerCase().trim();
       if (val === "retira" || val === "pickup") return "retira";
-      if (val === "envia" || val === "express") return "envia";
+      if (val === "envia" || val === "dac" || val === "express") return "envia";
     }
   }
 
-  // Default: nosotros retiramos en PCS y despachamos al cliente
+  // 2. Shipping rate de retiro Corner (en caso de re-habilitarse algún día)
+  const shippingLines = order.shipping_lines || [];
+  for (const sl of shippingLines) {
+    const title = (sl.title || "").toLowerCase();
+    const code  = (sl.code  || "").toLowerCase();
+
+    if (
+      title.includes("retiro corner") ||
+      title.includes("retiro en pc service") ||
+      code === "local_pickup" ||
+      code.includes("pcs_retira")
+    ) {
+      return "retira";
+    }
+  }
+
+  // 3. Default: PCS despacha al cliente vía DAC (caso normal post-Abr 2026)
   return "envia";
+}
+
+/**
+ * Extraer CI / RUT del cliente desde la orden de Shopify.
+ *
+ * SETUP CORNER (Abr 2026):
+ *   El checkout de Shopify usa el campo "Company" (renombrado "CI / RUT" via
+ *   Translate & Adapt: Contact > Company Label = "CI / RUT"). El cliente escribe
+ *   ahi su cedula o RUT, y Shopify lo guarda en `shipping_address.company`
+ *   (y/o `billing_address.company` si el billing es distinto).
+ *
+ * Prioridad de lookup:
+ *   1. shipping_address.company   <- caso normal post-Abr 2026
+ *   2. billing_address.company    <- por si el billing tiene CI distinto
+ *   3. note_attributes            <- fallback para checkouts custom
+ *   4. line_items[].properties    <- fallback por si esta como property
+ *
+ * Aceptamos cualquier valor con al menos 6 digitos cuando se quitan no-digitos
+ * (cubre formatos "1.234.567-8", "12345678", "21-602622-001-5000" para RUT).
+ */
+function extractCustomerCI(order) {
+  // 1. shipping_address.company  (caso normal)
+  const shipCo = String(order.shipping_address?.company || "").trim();
+  if (shipCo && shipCo.replace(/\D/g, "").length >= 6) return shipCo;
+
+  // 2. billing_address.company
+  const billCo = String(order.billing_address?.company || "").trim();
+  if (billCo && billCo.replace(/\D/g, "").length >= 6) return billCo;
+
+  // 3. note_attributes
+  const candidates = ["ci", "cedula", "cédula", "rut", "dni", "documento", "doc", "tax_id"];
+  for (const na of order.note_attributes || []) {
+    const name = String(na.name || "").toLowerCase().trim();
+    if (candidates.includes(name)) {
+      const val = String(na.value || "").trim();
+      if (val) return val;
+    }
+  }
+
+  // 4. line_items[].properties
+  for (const li of order.line_items || []) {
+    for (const p of li.properties || []) {
+      const name = String(p.name || "").toLowerCase().trim();
+      if (candidates.includes(name)) {
+        const val = String(p.value || "").trim();
+        if (val) return val;
+      }
+    }
+  }
+
+  return "";
+}
+
+/**
+ * Construye el `comment` del express_checkout segun el shipping mode.
+ *
+ * Formato (single-line, separado por " | "):
+ *   - Retiro Corner: "Cliente: {nombre} | RETIRO CORNER | Shopify #{N}"
+ *   - Envio DAC:     "Cliente: {nombre} | CI: {ci} | Tel: {phone} | Dir: {dir} | CP: {cp} | ENVIO DAC | Shopify #{N}"
+ *
+ * NO incluye "PCS despacha al cliente" - PCS no despacha a consumidor final;
+ * Corner siempre retira o usa DAC con destino del cliente final.
+ */
+function buildPcsComment(order, shippingMode, orderNumber) {
+  const cust = order.customer || {};
+  const sa   = order.shipping_address || order.billing_address || {};
+
+  let name = `${cust.first_name || ""} ${cust.last_name || ""}`.trim();
+  if (!name) name = String(sa.name || "(sin nombre)").trim();
+
+  const parts = [`Cliente: ${name}`];
+
+  if (shippingMode === "envia") {
+    const ci    = extractCustomerCI(order);
+    const phone = String(sa.phone || cust.phone || order.phone || "").trim();
+    const addr1 = String(sa.address1 || "").trim();
+    const addr2 = String(sa.address2 || "").trim();
+    const city  = String(sa.city || "").trim();
+    const prov  = String(sa.province || "").trim();
+    const cp    = String(sa.zip || "").trim();
+
+    let dir = addr1;
+    if (addr2) dir += " " + addr2;
+    if (city)  dir += ", " + city;
+    if (prov && city.toLowerCase() !== prov.toLowerCase()) dir += ", " + prov;
+
+    parts.push(`CI: ${ci}`);
+    parts.push(`Tel: ${phone}`);
+    parts.push(`Dir: ${dir}`);
+    parts.push(`CP: ${cp}`);
+    parts.push("ENVIO DAC");
+  } else {
+    parts.push("RETIRO CORNER");
+  }
+
+  parts.push(`Shopify #${orderNumber}`);
+
+  return parts.join(" | ");
 }
 
 // =====================
@@ -408,25 +500,17 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       return res.status(200).send("OK");
     }
 
-    // Construimos comentario/cliente
-    const cust = order.customer || {};
-    const ship = order.shipping_address || {};
-    const comment = [
-      `Cliente: ${cust.first_name || ""} ${cust.last_name || ""}`.trim(),
-      `Tel: ${ship.phone || order.phone || ""}`.trim(),
-      `Dir: ${ship.address1 || ""} ${ship.address2 || ""}, ${ship.city || ""}, ${ship.province || ""}`.trim(),
-      `CP: ${ship.zip || ""}`.trim(),
-    ]
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .join(" | ");
-
     const email = "ventas@corner.com.uy";
 
     // ── DETECTAR SHIPPING MODE desde shipping_lines ──
     const shippingMode = detectShippingMode(order);
     const shippingTitles = (order.shipping_lines || []).map((sl) => sl.title).join(", ") || "(ninguno)";
     log(`[SHIPPING] Orden #${orderNumber} shipping_lines=[${shippingTitles}] → mode="${shippingMode}"`);
+
+    // ── Comment estructurado segun shipping mode ──
+    //   retira -> solo nombre + RETIRO CORNER
+    //   envia  -> cliente + CI + Tel + Dir + CP + ENVIO DAC
+    const comment = buildPcsComment(order, shippingMode, orderNumber);
 
     // Armar items PCService por TAG proveedor_pcservice
     const items = [];
@@ -462,16 +546,12 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       return res.status(200).send("No PC Service items");
     }
 
-    // Enriquecer comentario con info de shipping para PCS
-    const shippingLabel = shippingMode === "retira"
-      ? "RETIRO EN PCS (cliente retira en local)"
-      : "ENVIO (PCS despacha al cliente)";
-    const fullComment = `${comment} | ${shippingLabel}`;
-
+    // El comment ya viene con el formato correcto desde buildPcsComment()
+    // (incluye RETIRO CORNER o ENVIO DAC segun corresponda).
     const pcsOrderId = await createPcServiceOrder({
       orderNumber,
       email,
-      comment: fullComment,
+      comment,
       items,
       shipping: shippingMode,
     });
